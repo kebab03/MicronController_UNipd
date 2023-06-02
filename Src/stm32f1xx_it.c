@@ -23,10 +23,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-//#define Tref 1679	// Tref = (50/100)*2^12 (per voltaggio *3.3/2^12)
-#define	kp 0xC12B		// 193.1664 (norm 49451) normalizzato con 2^8 e moltiplicati per 2^16
-#define	ki 0x9DDC		// 39.46474 (norm 40412) ki è moltiplicato per T_pwm=0.1 [s] 
-										// normalizzato con 2^6 e moltiplicato per 2^16
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,7 +33,10 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
- 
+#define F_CLK 0xF4240000		//rappr. Q32 64 MHz freq. Timer 1
+#define M 6									//indice di normalizz.
+#define COUNT_MAX	65536			//2^16
+#define MAX_OVERFLOW 325		//325,5 fmin = 3Hz
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,13 +46,20 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-int32_t pulse_value = 25000;
-int32_t Terr = 0;
-int32_t yp = 0;
-int32_t yi = 0;
-int32_t Ierr = 0;
-int32_t Ierr_prec = 0;
-uint16_t Tref = 1679;
+// uint16_t cont_int = 0;
+// uint32_t temp = 0;
+
+bool odd_rise = 0;              //variabile booleana per i fronti dispari
+uint16_t pulse_value = 0x3FFF;	// 16383 DC = 50%
+
+uint16_t cnt_old = 0;						//cnt1
+uint16_t cnt_new = 0;						//cnt3
+uint16_t cnt_overflow = 0;			//contatore per gli overflow
+
+uint32_t f_fan = 0;							//frequenza ventola (parte intera + parte frazionaria)
+uint32_t f_fan_int = 0;					//frequenza ventola parte intera
+uint32_t f_fan_frac = 0;				//frequenza ventola parte frazionaria
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,8 +74,9 @@ uint16_t Tref = 1679;
 
 /* External variables --------------------------------------------------------*/
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 /* USER CODE BEGIN EV */
-extern ADC_HandleTypeDef hadc2;
+
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -213,36 +221,64 @@ void SysTick_Handler(void)
 void TIM1_UP_IRQHandler(void)
 {
   /* USER CODE BEGIN TIM1_UP_IRQn 0 */
-	HAL_ADC_Start(&hadc2);
-	HAL_ADC_PollForConversion(&hadc2,2);
+	//if (cont_int==0) cont_int=1;	//variabile in modalità toggle
+	//else cont_int=0;
 	
-	Terr = Tref - HAL_ADC_GetValue(&hadc2);		//segnale di errore rispetto al riferimento
+	cnt_overflow++;
 	
-	yp = ((kp*Terr)>>8);		//contributo proporzionale
-	Ierr = Ierr_prec + Terr;		
-	Ierr_prec = Ierr;
-	
-	yi = ((ki*Ierr)>>10);		//contributo integrativo
-	
-	//anti-windup
-	//saturazione dell'uscita
-	if (((yp+yi))>0 && ((yp+yi))<50000){
-		pulse_value = (yp+yi);		//inserisco in pulse_value
-	}
-	else{
-		Ierr=Ierr-Terr;
-		Ierr_prec = Ierr;
-		yi = (ki*Ierr)>>10;
-		pulse_value = (yp+yi);
+	if (cnt_overflow > MAX_OVERFLOW){ 	// ventola ferma reset f_fan
+		f_fan = 0;
+		f_fan_int = 0;
+		f_fan_frac = 0;
+		cnt_overflow = 0;
 	}
 	
-	if (pulse_value<0) pulse_value = 0;
-	
-	htim1.Instance->CCR1 = pulse_value;		//aggiornamento del registro CCR1
   /* USER CODE END TIM1_UP_IRQn 0 */
   HAL_TIM_IRQHandler(&htim1);
   /* USER CODE BEGIN TIM1_UP_IRQn 1 */
+
   /* USER CODE END TIM1_UP_IRQn 1 */
+}
+
+/**
+  * @brief This function handles TIM1 capture compare interrupt.
+  */
+void TIM1_CC_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM1_CC_IRQn 0 */
+	
+	//temp = htim1.Instance->CCR1;
+	
+	if(odd_rise){
+		cnt_old = cnt_new;							//valore precedente contatore
+		cnt_new = htim1.Instance->CCR1;	//leggo da C.R. nuovo valore
+
+		f_fan = F_CLK/(cnt_new - cnt_old + cnt_overflow*COUNT_MAX);	// f_fan
+		f_fan_int = f_fan >> M;					//ricavo parte intera
+		f_fan_frac = (f_fan<<26)>>26;		//ricavo parte frazionaria
+		cnt_overflow = 0;								//reset cnt_overflow
+	}
+	odd_rise = !odd_rise;							//switch variabile booleana
+
+	/* USER CODE END TIM1_CC_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim1);
+  /* USER CODE BEGIN TIM1_CC_IRQn 1 */
+  /* USER CODE END TIM1_CC_IRQn 1 */
+}
+
+/**
+  * @brief This function handles TIM2 global interrupt.
+  */
+void TIM2_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM2_IRQn 0 */
+	htim2.Instance->CCR1 = pulse_value;			//aggiornamento D.C. PWM
+																					//variabile modificabile da watch_window
+	  /* USER CODE END TIM2_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim2);
+  /* USER CODE BEGIN TIM2_IRQn 1 */
+
+  /* USER CODE END TIM2_IRQn 1 */
 }
 
 /**
@@ -251,7 +287,7 @@ void TIM1_UP_IRQHandler(void)
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-
+	
   /* USER CODE END EXTI15_10_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
